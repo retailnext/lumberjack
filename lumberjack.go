@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,9 +108,13 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
-	size int64
-	file *os.File
-	mu   sync.Mutex
+	// Use appended index for backup files instead of timestamp.
+	UseIndex bool
+
+	size      int64
+	file      *os.File
+	mu        sync.Mutex
+	lastIndex int
 
 	millCh    chan bool
 	startMill sync.Once
@@ -218,7 +223,7 @@ func (l *Logger) openNew() error {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -244,18 +249,63 @@ func (l *Logger) openNew() error {
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
-func backupName(name string, local bool) string {
-	dir := filepath.Dir(name)
-	filename := filepath.Base(name)
-	ext := filepath.Ext(filename)
-	prefix := filename[:len(filename)-len(ext)]
-	t := currentTime()
-	if !local {
-		t = t.UTC()
+func (l *Logger) backupName(name string) string {
+	if l.UseIndex {
+		l.lastIndex++
+		return fmt.Sprintf("%s.%d", name, l.lastIndex)
+	} else {
+		dir := filepath.Dir(name)
+		filename := filepath.Base(name)
+		ext := filepath.Ext(filename)
+		prefix := filename[:len(filename)-len(ext)]
+		t := currentTime()
+		if !l.LocalTime {
+			t = t.UTC()
+		}
+
+		timestamp := t.Format(backupTimeFormat)
+		return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	}
+}
+
+func (l *Logger) getLastIndex() (int, error) {
+	dirName := filepath.Dir(l.Filename)
+	dir, err := os.Open(dirName)
+	if err != nil {
+		return 0, err
+	}
+	defer dir.Close()
+
+	baseName := filepath.Base(l.filename())
+	prefix := baseName + "."
+	lastIndex := 0
+
+	for {
+		names, err := dir.Readdirnames(100)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return 0, err
+		}
+		for _, name := range names {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = name[len(prefix):]
+			if strings.HasSuffix(name, compressSuffix) {
+				name = name[:len(name)-len(compressSuffix)]
+			}
+			index, err := strconv.Atoi(name)
+			if err != nil {
+				continue
+			}
+			if index > lastIndex {
+				lastIndex = index
+			}
+		}
 	}
 
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	return lastIndex, nil
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -263,6 +313,14 @@ func backupName(name string, local bool) string {
 // put it over the MaxSize, a new file is created.
 func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
+
+	if l.UseIndex {
+		lastIndex, err := l.getLastIndex()
+		if err != nil {
+			return err
+		}
+		l.lastIndex = lastIndex
+	}
 
 	filename := l.filename()
 	info, err := os_Stat(filename)
@@ -339,7 +397,13 @@ func (l *Logger) millRunOnce() error {
 
 		var remaining []logInfo
 		for _, f := range files {
-			if f.timestamp.Before(cutoff) {
+			var fileTime time.Time
+			if l.UseIndex {
+				fileTime = f.FileInfo.ModTime()
+			} else {
+				fileTime = f.timestamp
+			}
+			if fileTime.Before(cutoff) {
 				remove = append(remove, f)
 			} else {
 				remaining = append(remaining, f)
@@ -404,25 +468,45 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	}
 	logFiles := []logInfo{}
 
-	prefix, ext := l.prefixAndExt()
+	var prefix, ext string
+	if l.UseIndex {
+		prefix = filepath.Base(l.filename()) + "."
+	} else {
+		prefix, ext = l.prefixAndExt()
+	}
 
 	for _, f := range files {
 		if f.IsDir() {
 			continue
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
-			continue
+		if l.UseIndex {
+			if index, err := l.indexFromName(f.Name(), prefix, ""); err == nil {
+				logFiles = append(logFiles, logInfo{index: index, FileInfo: f})
+				continue
+			}
+			if index, err := l.indexFromName(f.Name(), prefix, compressSuffix); err == nil {
+				logFiles = append(logFiles, logInfo{index: index, FileInfo: f})
+				continue
+			}
+		} else {
+			if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
+				logFiles = append(logFiles, logInfo{timestamp: t, FileInfo: f})
+				continue
+			}
+			if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
+				logFiles = append(logFiles, logInfo{timestamp: t, FileInfo: f})
+				continue
+			}
+			// error parsing means that the suffix at the end was not generated
+			// by lumberjack, and therefore it's not a backup file.
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
-			continue
-		}
-		// error parsing means that the suffix at the end was not generated
-		// by lumberjack, and therefore it's not a backup file.
 	}
 
-	sort.Sort(byFormatTime(logFiles))
+	if l.UseIndex {
+		sort.Sort(byIndex(logFiles))
+	} else {
+		sort.Sort(byFormatTime(logFiles))
+	}
 
 	return logFiles, nil
 }
@@ -439,6 +523,22 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
 	return time.Parse(backupTimeFormat, ts)
+}
+
+func (l *Logger) indexFromName(filename, prefix, ext string) (int, error) {
+	if !strings.HasPrefix(filename, prefix) {
+		return 0, errors.New("mismatched prefix")
+	}
+	filename = filename[len(prefix):]
+
+	if ext != "" {
+		if !strings.HasSuffix(filename, ext) {
+			return 0, errors.New("mismatched extension")
+		}
+		filename = filename[:len(filename)-len(ext)]
+	}
+
+	return strconv.Atoi(filename)
 }
 
 // max returns the maximum size in bytes of log files before rolling.
@@ -522,6 +622,7 @@ func compressLogFile(src, dst string) (err error) {
 // timestamp.
 type logInfo struct {
 	timestamp time.Time
+	index     int
 	os.FileInfo
 }
 
@@ -537,5 +638,20 @@ func (b byFormatTime) Swap(i, j int) {
 }
 
 func (b byFormatTime) Len() int {
+	return len(b)
+}
+
+// byIndex sorts by index, highest (newest) first
+type byIndex []logInfo
+
+func (b byIndex) Less(i, j int) bool {
+	return b[i].index > b[j].index
+}
+
+func (b byIndex) Swap(i, j int) {
+	b[i], b[j] = b[j], b[i]
+}
+
+func (b byIndex) Len() int {
 	return len(b)
 }

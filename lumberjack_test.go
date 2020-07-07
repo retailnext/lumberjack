@@ -165,6 +165,51 @@ func TestAutoRotate(t *testing.T) {
 	fileCount(dir, 2, t)
 }
 
+func TestAutoRotateUsingIndex(t *testing.T) {
+	megabyte = 1
+
+	dir := makeTempDir("TestAutoRotate", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename: filename,
+		MaxSize:  10,
+		UseIndex: true,
+	}
+	defer l.Close()
+
+	// Put some backup files out there to make sure we use the correct index.
+	err := ioutil.WriteFile(filename+".40", []byte("chambering-gonyoncus"), 0600)
+	isNil(err, t)
+	err = ioutil.WriteFile(filename+".41", []byte("decoratively-genarcha"), 0600)
+	isNil(err, t)
+
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	existsWithContent(filename, b, t)
+	fileCount(dir, 3, t)
+
+	newFakeTime()
+
+	b2 := []byte("foooooo!")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	// the old logfile should be moved aside and the main logfile should have
+	// only the last write in it.
+	existsWithContent(filename, b2, t)
+
+	// the backup file will have the index 1 and have the old contents.
+	existsWithContent(backupFileUsingIndex(dir, 42), b, t)
+
+	fileCount(dir, 4, t)
+}
+
 func TestFirstWriteRotate(t *testing.T) {
 	currentTime = fakeTime
 	megabyte = 1
@@ -321,6 +366,120 @@ func TestMaxBackups(t *testing.T) {
 	exists(notlogfiledir, t)
 }
 
+func TestMaxBackupsUsingIndex(t *testing.T) {
+	megabyte = 1
+	dir := makeTempDir("TestMaxBackups", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename:   filename,
+		MaxSize:    10,
+		MaxBackups: 1,
+		UseIndex:   true,
+	}
+	defer l.Close()
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	existsWithContent(filename, b, t)
+	fileCount(dir, 1, t)
+
+	// this will put us over the max
+	b2 := []byte("foooooo!")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	secondFilename := backupFileUsingIndex(dir, 1)
+	existsWithContent(secondFilename, b, t)
+
+	// make sure the old file still exists with the same content.
+	existsWithContent(filename, b2, t)
+
+	fileCount(dir, 2, t)
+
+	// this will make us rotate again
+	b3 := []byte("baaaaaar!")
+	n, err = l.Write(b3)
+	isNil(err, t)
+	equals(len(b3), n, t)
+
+	thirdFilename := backupFileUsingIndex(dir, 2)
+	existsWithContent(thirdFilename, b2, t)
+
+	existsWithContent(filename, b3, t)
+
+	// we need to wait a little bit since the files get deleted on a different
+	// goroutine.
+	<-time.After(time.Millisecond * 10)
+
+	// should only have two files in the dir still
+	fileCount(dir, 2, t)
+
+	// second file name should still exist
+	existsWithContent(thirdFilename, b2, t)
+
+	// should have deleted the first backup
+	notExist(secondFilename, t)
+
+	// now test that we don't delete directories or non-logfile files
+
+	// create a file that is close to but different from the logfile name.
+	// It shouldn't get caught by our deletion filters.
+	notlogfile := logFile(dir) + ".foo"
+	err = ioutil.WriteFile(notlogfile, []byte("data"), 0644)
+	isNil(err, t)
+
+	// Make a directory that exactly matches our log file filters... it still
+	// shouldn't get caught by the deletion filter since it's a directory.
+	notlogfiledir := backupFile(dir)
+	err = os.Mkdir(notlogfiledir, 0700)
+	isNil(err, t)
+
+	fourthFilename := backupFileUsingIndex(dir, 3)
+
+	// Create a log file that is/was being compressed - this should
+	// not be counted since both the compressed and the uncompressed
+	// log files still exist.
+	compLogFile := fourthFilename + compressSuffix
+	err = ioutil.WriteFile(compLogFile, []byte("compress"), 0644)
+	isNil(err, t)
+
+	// this will make us rotate again
+	b4 := []byte("baaaaaaz!")
+	n, err = l.Write(b4)
+	isNil(err, t)
+	equals(len(b4), n, t)
+
+	existsWithContent(fourthFilename, b3, t)
+	existsWithContent(fourthFilename+compressSuffix, []byte("compress"), t)
+
+	// we need to wait a little bit since the files get deleted on a different
+	// goroutine.
+	<-time.After(time.Millisecond * 10)
+
+	// We should have four things in the directory now - the 2 log files, the
+	// not log file, and the directory
+	fileCount(dir, 5, t)
+
+	// third file name should still exist
+	existsWithContent(filename, b4, t)
+
+	existsWithContent(fourthFilename, b3, t)
+
+	// should have deleted the first filename
+	notExist(thirdFilename, t)
+
+	// the not-a-logfile should still exist
+	exists(notlogfile, t)
+
+	// the directory
+	exists(notlogfiledir, t)
+}
+
 func TestCleanupExistingBackups(t *testing.T) {
 	// test that if we start with more backup files than we're supposed to have
 	// in total, that extra ones get cleaned up when we rotate.
@@ -359,6 +518,58 @@ func TestCleanupExistingBackups(t *testing.T) {
 		Filename:   filename,
 		MaxSize:    10,
 		MaxBackups: 1,
+	}
+	defer l.Close()
+
+	newFakeTime()
+
+	b2 := []byte("foooooo!")
+	n, err := l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	// we need to wait a little bit since the files get deleted on a different
+	// goroutine.
+	<-time.After(time.Millisecond * 10)
+
+	// now we should only have 2 files left - the primary and one backup
+	fileCount(dir, 2, t)
+}
+
+func TestCleanupExistingBackupsUsingIndex(t *testing.T) {
+	// test that if we start with more backup files than we're supposed to have
+	// in total, that extra ones get cleaned up when we rotate.
+
+	megabyte = 1
+
+	dir := makeTempDir("TestCleanupExistingBackups", t)
+	defer os.RemoveAll(dir)
+
+	// make 3 backup files
+
+	data := []byte("data")
+	backup := backupFileUsingIndex(dir, 1)
+	err := ioutil.WriteFile(backup, data, 0644)
+	isNil(err, t)
+
+	backup = backupFileUsingIndex(dir, 2)
+	err = ioutil.WriteFile(backup+compressSuffix, data, 0644)
+	isNil(err, t)
+
+	backup = backupFileUsingIndex(dir, 3)
+	err = ioutil.WriteFile(backup, data, 0644)
+	isNil(err, t)
+
+	// now create a primary log file with some data
+	filename := logFile(dir)
+	err = ioutil.WriteFile(filename, data, 0644)
+	isNil(err, t)
+
+	l := &Logger{
+		Filename:   filename,
+		MaxSize:    10,
+		MaxBackups: 1,
+		UseIndex:   true,
 	}
 	defer l.Close()
 
@@ -484,6 +695,35 @@ func TestOldLogFiles(t *testing.T) {
 	equals(t1, files[1].timestamp, t)
 }
 
+func TestOldLogFilesUsingIndex(t *testing.T) {
+	megabyte = 1
+
+	dir := makeTempDir("TestOldLogFiles", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	data := []byte("data")
+	err := ioutil.WriteFile(filename, data, 07)
+	isNil(err, t)
+
+	backup := backupFileUsingIndex(dir, 1)
+	err = ioutil.WriteFile(backup, data, 07)
+	isNil(err, t)
+
+	backup2 := backupFileUsingIndex(dir, 2)
+	err = ioutil.WriteFile(backup2, data, 07)
+	isNil(err, t)
+
+	l := &Logger{Filename: filename, UseIndex: true}
+	files, err := l.oldLogFiles()
+	isNil(err, t)
+	equals(2, len(files), t)
+
+	// should be sorted by newest file first, which would be index 2
+	equals(2, files[0].index, t)
+	equals(1, files[1].index, t)
+}
+
 func TestTimeFromName(t *testing.T) {
 	l := &Logger{Filename: "/var/log/myfoo/foo.log"}
 	prefix, ext := l.prefixAndExt()
@@ -504,6 +744,35 @@ func TestTimeFromName(t *testing.T) {
 		equals(got, test.want, t)
 		equals(err != nil, test.wantErr, t)
 	}
+}
+
+func TestIndexFromName(t *testing.T) {
+	fileName := "/var/log/something.log"
+	l := &Logger{
+		Filename: fileName,
+	}
+
+	prefix := fileName + "."
+
+	index, err := l.indexFromName(fileName+".123", prefix, "")
+	isNil(err, t)
+	equals(123, index, t)
+
+	index, err = l.indexFromName(fileName+".777.gz", prefix, ".gz")
+	isNil(err, t)
+	equals(777, index, t)
+
+	index, err = l.indexFromName(fileName, prefix, "")
+	notNil(err, t)
+
+	index, err = l.indexFromName(fileName+".42.xyz", prefix, ".gz")
+	notNil(err, t)
+
+	index, err = l.indexFromName(fileName+".xyz", prefix, "")
+	notNil(err, t)
+
+	index, err = l.indexFromName("/var/log/something_else.log.99", prefix, "")
+	notNil(err, t)
 }
 
 func TestLocalTime(t *testing.T) {
@@ -587,6 +856,59 @@ func TestRotate(t *testing.T) {
 	equals(len(b2), n, t)
 
 	// this will use the new fake time
+	existsWithContent(filename, b2, t)
+}
+
+func TestRotateUsingIndex(t *testing.T) {
+	dir := makeTempDir("TestRotate", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+
+	l := &Logger{
+		Filename:   filename,
+		MaxBackups: 1,
+		MaxSize:    100, // megabytes
+		UseIndex:   true,
+	}
+	defer l.Close()
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	existsWithContent(filename, b, t)
+	fileCount(dir, 1, t)
+
+	err = l.Rotate()
+	isNil(err, t)
+
+	// we need to wait a little bit since the files get deleted on a different
+	// goroutine.
+	<-time.After(10 * time.Millisecond)
+
+	filename2 := backupFileUsingIndex(dir, 1)
+	existsWithContent(filename2, b, t)
+	existsWithContent(filename, []byte{}, t)
+	fileCount(dir, 2, t)
+
+	err = l.Rotate()
+	isNil(err, t)
+
+	// we need to wait a little bit since the files get deleted on a different
+	// goroutine.
+	<-time.After(10 * time.Millisecond)
+
+	filename3 := backupFileUsingIndex(dir, 2)
+	existsWithContent(filename3, []byte{}, t)
+	existsWithContent(filename, []byte{}, t)
+	fileCount(dir, 2, t)
+
+	b2 := []byte("foooooo!")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
 	existsWithContent(filename, b2, t)
 }
 
@@ -751,6 +1073,42 @@ compress = true`[1:]
 	equals(0, len(md.Undecoded()), t)
 }
 
+func TestGetLastIndex(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "lumberjack")
+	isNil(err, t)
+	defer os.RemoveAll(tempDir)
+
+	fileName := filepath.Join(tempDir, "my_log.log")
+
+	l := &Logger{
+		Filename: fileName,
+	}
+
+	lastIndex, err := l.getLastIndex()
+	isNil(err, t)
+	equals(0, lastIndex, t)
+
+	logFiles := []string{
+		"my_log.log",
+		"my_log.log.1",
+		"my_log.log.2",
+		"my_log.log.3",
+		"my_log.log.x",
+		"my_log.log.4x",
+		"potomania-ascogenous.log",
+	}
+
+	for _, fn := range logFiles {
+		f, err := os.Create(filepath.Join(tempDir, fn))
+		isNil(err, t)
+		f.Close()
+	}
+
+	lastIndex, err = l.getLastIndex()
+	isNil(err, t)
+	equals(3, lastIndex, t)
+}
+
 // makeTempDir creates a file with a semi-unique name in the OS temp directory.
 // It should be based on the name of the test, to keep parallel tests from
 // colliding, and must be cleaned up after the test is finished.
@@ -784,6 +1142,10 @@ func backupFile(dir string) string {
 
 func backupFileLocal(dir string) string {
 	return filepath.Join(dir, "foobar-"+fakeTime().Format(backupTimeFormat)+".log")
+}
+
+func backupFileUsingIndex(dir string, index int) string {
+	return filepath.Join(dir, fmt.Sprintf("foobar.log.%d", index))
 }
 
 // logFileLocal returns the log file name in the given directory for the current
